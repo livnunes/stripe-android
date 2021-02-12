@@ -1,15 +1,16 @@
 package com.stripe.android.paymentsheet
 
-import android.content.Intent
 import android.os.Parcelable
 import androidx.activity.ComponentActivity
+import com.stripe.android.PaymentConfiguration
+import com.stripe.android.paymentsheet.flowcontroller.FlowControllerFactory
 import com.stripe.android.paymentsheet.model.PaymentOption
 import kotlinx.parcelize.Parcelize
 
-internal class PaymentSheet internal constructor(
+class PaymentSheet internal constructor(
     private val paymentSheetLauncher: PaymentSheetLauncher
 ) {
-    constructor(
+    internal constructor(
         activity: ComponentActivity,
         callback: PaymentSheetResultCallback
     ) : this(
@@ -19,7 +20,7 @@ internal class PaymentSheet internal constructor(
     /**
      * Create PaymentSheet with a Customer
      */
-    fun present(
+    internal fun present(
         paymentIntentClientSecret: String,
         configuration: Configuration
     ) {
@@ -29,20 +30,25 @@ internal class PaymentSheet internal constructor(
     /**
      * Create PaymentSheet without a Customer
      */
-    fun present(
+    internal fun present(
         paymentIntentClientSecret: String
     ) {
         paymentSheetLauncher.present(paymentIntentClientSecret)
     }
 
     @Parcelize
-    data class Configuration(
+    data class Configuration @JvmOverloads constructor(
         /**
          * Your customer-facing business name.
          *
          * The default value is the name of your app.
          */
         var merchantDisplayName: String,
+
+        /**
+         * If set, the customer can select a previously saved payment method within PaymentSheet.
+         */
+        var customer: CustomerConfiguration? = null,
 
         /**
          * Configuration related to the Stripe Customer making a payment.
@@ -56,12 +62,7 @@ internal class PaymentSheet internal constructor(
          *
          * See [BillingAddressCollectionLevel]
          */
-        var billingAddressCollection: BillingAddressCollectionLevel = BillingAddressCollectionLevel.Automatic,
-
-        /**
-         * If set, the customer can select a previously saved payment method within PaymentSheet.
-         */
-        var customer: CustomerConfiguration? = null
+        var billingAddressCollection: BillingAddressCollectionLevel = BillingAddressCollectionLevel.Automatic
     ) : Parcelable
 
     enum class BillingAddressCollectionLevel {
@@ -110,59 +111,52 @@ internal class PaymentSheet internal constructor(
         }
     }
 
-    interface FlowController {
+    internal interface FlowController {
         fun getPaymentOption(): PaymentOption?
 
-        fun presentPaymentOptions(activity: ComponentActivity)
-
-        fun onPaymentOptionResult(intent: Intent?): PaymentOption?
-
-        fun confirmPayment(activity: ComponentActivity)
-
-        fun isPaymentResult(
-            requestCode: Int,
-            data: Intent?
-        ): Boolean
-
-        fun onPaymentResult(
-            requestCode: Int,
-            data: Intent?,
-            callback: PaymentSheetResultCallback
+        fun configure(
+            paymentIntentClientSecret: String,
+            configuration: Configuration,
+            callback: ConfigCallback
         )
 
+        fun configure(
+            paymentIntentClientSecret: String,
+            callback: ConfigCallback
+        )
+
+        fun presentPaymentOptions()
+
+        fun confirmPayment()
+
         sealed class Result {
-            class Success(
-                val flowController: FlowController
-            ) : Result()
+            object Success : Result()
 
             class Failure(
                 val error: Throwable
             ) : Result()
         }
 
-        companion object {
-            fun create(
-                activity: ComponentActivity,
-                clientSecret: String,
-                configuration: Configuration,
-                onComplete: (Result) -> Unit
-            ) {
-                PaymentSheetFlowControllerFactory(activity).create(
-                    clientSecret,
-                    configuration,
-                    onComplete
-                )
-            }
+        fun interface ConfigCallback {
+            fun onConfigured(
+                success: Boolean,
+                error: Throwable?
+            )
+        }
 
+        companion object {
+            @JvmStatic
             fun create(
                 activity: ComponentActivity,
-                clientSecret: String,
-                onComplete: (Result) -> Unit
-            ) {
-                PaymentSheetFlowControllerFactory(activity).create(
-                    clientSecret,
-                    onComplete
-                )
+                paymentOptionCallback: PaymentOptionCallback,
+                paymentResultCallback: PaymentSheetResultCallback
+            ): FlowController {
+                return FlowControllerFactory(
+                    activity,
+                    PaymentConfiguration.getInstance(activity),
+                    paymentOptionCallback,
+                    paymentResultCallback
+                ).create()
             }
         }
     }

@@ -2,10 +2,12 @@ package com.stripe.android
 
 import android.content.Context
 import android.content.Intent
+import androidx.activity.result.ActivityResultLauncher
 import android.content.res.Resources
 import android.net.Uri
 import android.util.Base64
 import androidx.annotation.VisibleForTesting
+import com.stripe.android.auth.PaymentAuthWebViewContract
 import com.stripe.android.exception.StripeException
 import com.stripe.android.model.ConfirmPaymentIntentParams
 import com.stripe.android.model.ConfirmSetupIntentParams
@@ -25,9 +27,14 @@ import com.stripe.android.networking.AnalyticsRequestExecutor
 import com.stripe.android.networking.ApiRequest
 import com.stripe.android.networking.DefaultAlipayRepository
 import com.stripe.android.networking.StripeRepository
+import com.stripe.android.payments.DefaultPaymentFlowResultProcessor
+import com.stripe.android.payments.PaymentFlowFailureMessageFactory
+import com.stripe.android.payments.PaymentFlowResult
+import com.stripe.android.payments.Stripe3ds2CompletionStarter
 import com.stripe.android.stripe3ds2.init.ui.StripeUiCustomization
 import com.stripe.android.stripe3ds2.service.StripeThreeDs2Service
 import com.stripe.android.stripe3ds2.service.StripeThreeDs2ServiceImpl
+import com.stripe.android.stripe3ds2.transaction.ChallengeFlowOutcome
 import com.stripe.android.stripe3ds2.transaction.ChallengeParameters
 import com.stripe.android.stripe3ds2.transaction.CompletionEvent
 import com.stripe.android.stripe3ds2.transaction.MessageVersionRegistry
@@ -39,7 +46,6 @@ import com.stripe.android.stripe3ds2.transaction.StripeChallengeStatusReceiver
 import com.stripe.android.stripe3ds2.transaction.Transaction
 import com.stripe.android.stripe3ds2.views.ChallengeProgressActivity
 import com.stripe.android.view.AuthActivityStarter
-import com.stripe.android.view.Stripe3ds2CompletionActivity
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
@@ -73,11 +79,40 @@ internal class StripePaymentController internal constructor(
     private val challengeProgressActivityStarter: ChallengeProgressActivityStarter =
         ChallengeProgressActivityStarter.Default(),
     private val alipayRepository: AlipayRepository = DefaultAlipayRepository(stripeRepository),
-    private val workContext: CoroutineContext = Dispatchers.IO,
-    private val resources: Resources = context.applicationContext.resources
+    private val paymentRelayLauncher: ActivityResultLauncher<PaymentRelayStarter.Args>? = null,
+    private val paymentAuthWebViewLauncher: ActivityResultLauncher<PaymentAuthWebViewContract.Args>? = null,
+    private val stripe3ds2ChallengeLauncher: ActivityResultLauncher<PaymentFlowResult.Unvalidated>? = null,
+    private val workContext: CoroutineContext = Dispatchers.IO
 ) : PaymentController {
+    private val failureMessageFactory = PaymentFlowFailureMessageFactory(context)
+    private val paymentFlowResultProcessor = DefaultPaymentFlowResultProcessor(
+        context,
+        publishableKey,
+        stripeRepository,
+        enableLogging,
+        workContext
+    )
+
     private val logger = Logger.getInstance(enableLogging)
     private val analyticsRequestFactory = AnalyticsRequest.Factory(logger)
+
+    private val paymentRelayStarterFactory = { host: AuthActivityStarter.Host ->
+        paymentRelayLauncher?.let {
+            PaymentRelayStarter.Modern(it)
+        } ?: PaymentRelayStarter.Legacy(host)
+    }
+
+    private val paymentAuthWebViewStarterFactory = { host: AuthActivityStarter.Host ->
+        paymentAuthWebViewLauncher?.let {
+            PaymentAuthWebViewStarter.Modern(it)
+        } ?: PaymentAuthWebViewStarter.Legacy(host)
+    }
+
+    private val stripe3ds2CompletionStarterFactory = { host: AuthActivityStarter.Host, requestCode: Int ->
+        stripe3ds2ChallengeLauncher?.let {
+            Stripe3ds2CompletionStarter.Modern(it)
+        } ?: Stripe3ds2CompletionStarter.Legacy(host, requestCode)
+    }
 
     init {
         threeDs2Service.initialize(
@@ -97,6 +132,7 @@ internal class StripePaymentController internal constructor(
             confirmStripeIntentParams,
             requestOptions,
             ConfirmStripeIntentCallback(
+                paymentRelayStarterFactory(host),
                 host,
                 requestOptions,
                 this,
@@ -139,8 +175,8 @@ internal class StripePaymentController internal constructor(
                     onSuccess = { intent ->
                         callback.onSuccess(intent)
                     },
-                    onFailure = { error ->
-                        callback.onError(StripeException.create(error))
+                    onFailure = {
+                        dispatchError(it, callback)
                     }
                 )
             }
@@ -178,7 +214,18 @@ internal class StripePaymentController internal constructor(
                         handleNextAction(host, stripeIntent, requestOptions)
                     },
                     onFailure = {
-                        handleError(host, PAYMENT_REQUEST_CODE, it)
+                        handleError(
+                            paymentRelayStarterFactory(host),
+                            when (type) {
+                                PaymentController.StripeIntentType.PaymentIntent -> {
+                                    PAYMENT_REQUEST_CODE
+                                }
+                                PaymentController.StripeIntentType.SetupIntent -> {
+                                    SETUP_REQUEST_CODE
+                                }
+                            },
+                            it
+                        )
                     }
                 )
             }
@@ -205,7 +252,7 @@ internal class StripePaymentController internal constructor(
                     stripeRepository.retrieveSource(
                         sourceId = source.id.orEmpty(),
                         clientSecret = source.clientSecret.orEmpty(),
-                        options = requestOptions,
+                        options = requestOptions
                     )
                 )
             }
@@ -216,7 +263,11 @@ internal class StripePaymentController internal constructor(
                         onSourceRetrieved(host, retrievedSourced, requestOptions)
                     },
                     onFailure = {
-                        handleError(host, SOURCE_REQUEST_CODE, it)
+                        handleError(
+                            paymentRelayStarterFactory(host),
+                            SOURCE_REQUEST_CODE,
+                            it
+                        )
                     }
                 )
             }
@@ -238,11 +289,9 @@ internal class StripePaymentController internal constructor(
                 )
             )
 
-            PaymentAuthWebViewStarter(
-                host,
-                SOURCE_REQUEST_CODE
-            ).start(
-                PaymentAuthWebViewStarter.Args(
+            paymentAuthWebViewStarterFactory(host).start(
+                PaymentAuthWebViewContract.Args(
+                    requestCode = SOURCE_REQUEST_CODE,
                     clientSecret = source.clientSecret.orEmpty(),
                     url = source.redirect?.url.orEmpty(),
                     returnUrl = source.redirect?.returnUrl,
@@ -286,57 +335,19 @@ internal class StripePaymentController internal constructor(
         data: Intent,
         callback: ApiResultCallback<PaymentIntentResult>
     ) {
-        val result = PaymentController.Result.fromIntent(data) ?: PaymentController.Result()
-        val authException = result.exception
-        if (authException is Exception) {
-            callback.onError(authException)
-            return
-        }
-
-        val clientSecret = getClientSecret(data)
-        if (clientSecret.isNullOrBlank()) {
-            callback.onError(IllegalArgumentException(CLIENT_SECRET_INTENT_ERROR))
-            return
-        }
-
-        val shouldCancelSource = result.shouldCancelSource
-        val sourceId = result.sourceId.orEmpty()
-        @StripeIntentResult.Outcome val flowOutcome = result.flowOutcome
-
-        val requestOptions = ApiRequest.Options(
-            apiKey = publishableKey,
-            stripeAccount = result.stripeAccountId
-        )
-
         CoroutineScope(workContext).launch {
-            val paymentIntentResult = runCatching {
-                requireNotNull(
-                    stripeRepository.retrievePaymentIntent(
-                        clientSecret,
-                        requestOptions,
-                        expandFields = EXPAND_PAYMENT_METHOD
-                    )
+            runCatching {
+                paymentFlowResultProcessor.processPaymentIntent(
+                    PaymentFlowResult.Unvalidated.fromIntent(data)
                 )
-            }
-
-            withContext(Dispatchers.Main) {
-                val paymentIntentCallback = createPaymentIntentCallback(
-                    requestOptions,
-                    flowOutcome,
-                    sourceId,
-                    shouldCancelSource,
-                    callback
-                )
-
-                paymentIntentResult.fold(
-                    onSuccess = {
-                        paymentIntentCallback.onSuccess(it)
-                    },
-                    onFailure = {
-                        paymentIntentCallback.onError(StripeException.create(it))
-                    }
-                )
-            }
+            }.fold(
+                onSuccess = {
+                    dispatchPaymentIntentResult(it, callback)
+                },
+                onFailure = {
+                    dispatchError(it, callback)
+                }
+            )
         }
     }
 
@@ -353,57 +364,19 @@ internal class StripePaymentController internal constructor(
         data: Intent,
         callback: ApiResultCallback<SetupIntentResult>
     ) {
-        val result = PaymentController.Result.fromIntent(data) ?: PaymentController.Result()
-        val authException = result.exception
-        if (authException is Exception) {
-            callback.onError(authException)
-            return
-        }
-
-        val clientSecret = getClientSecret(data)
-        if (clientSecret.isNullOrBlank()) {
-            callback.onError(IllegalArgumentException(CLIENT_SECRET_INTENT_ERROR))
-            return
-        }
-
-        val shouldCancelSource = result.shouldCancelSource
-        val sourceId = result.sourceId.orEmpty()
-        @StripeIntentResult.Outcome val flowOutcome = result.flowOutcome
-
-        val requestOptions = ApiRequest.Options(
-            apiKey = publishableKey,
-            stripeAccount = result.stripeAccountId
-        )
-
         CoroutineScope(workContext).launch {
-            val setupIntentResult = runCatching {
-                requireNotNull(
-                    stripeRepository.retrieveSetupIntent(
-                        clientSecret,
-                        requestOptions,
-                        expandFields = EXPAND_PAYMENT_METHOD
-                    )
+            runCatching {
+                paymentFlowResultProcessor.processSetupIntent(
+                    PaymentFlowResult.Unvalidated.fromIntent(data)
                 )
-            }
-
-            withContext(Dispatchers.Main) {
-                val setupIntentCallback = createSetupIntentCallback(
-                    requestOptions,
-                    flowOutcome,
-                    sourceId,
-                    shouldCancelSource,
-                    callback
-                )
-
-                setupIntentResult.fold(
-                    onSuccess = {
-                        setupIntentCallback.onSuccess(it)
-                    },
-                    onFailure = {
-                        callback.onError(StripeException.create(it))
-                    }
-                )
-            }
+            }.fold(
+                onSuccess = {
+                    dispatchSetupIntentResult(it, callback)
+                },
+                onFailure = {
+                    dispatchError(it, callback)
+                }
+            )
         }
     }
 
@@ -411,13 +384,13 @@ internal class StripePaymentController internal constructor(
         data: Intent,
         callback: ApiResultCallback<Source>
     ) {
-        val result = PaymentController.Result.fromIntent(data)
-        val sourceId = result?.sourceId.orEmpty()
-        val clientSecret = result?.clientSecret.orEmpty()
+        val result = PaymentFlowResult.Unvalidated.fromIntent(data)
+        val sourceId = result.sourceId.orEmpty()
+        val clientSecret = result.clientSecret.orEmpty()
 
         val requestOptions = ApiRequest.Options(
             apiKey = publishableKey,
-            stripeAccount = result?.stripeAccountId
+            stripeAccount = result.stripeAccountId
         )
 
         analyticsRequestExecutor.executeAsync(
@@ -440,7 +413,7 @@ internal class StripePaymentController internal constructor(
                 sourceResult.fold(
                     onSuccess = callback::onSuccess,
                     onFailure = {
-                        callback.onError(StripeException.create(it))
+                        dispatchError(it, callback)
                     }
                 )
             }
@@ -472,14 +445,14 @@ internal class StripePaymentController internal constructor(
                 PaymentIntentResult(
                     paymentIntent,
                     alipayAuth.outcome,
-                    getFailureMessage(paymentIntent, alipayAuth.outcome)
+                    failureMessageFactory.create(paymentIntent, alipayAuth.outcome)
                 )
             }.let { result ->
                 withContext(Dispatchers.Main) {
                     result.fold(
                         onSuccess = callback::onSuccess,
                         onFailure = {
-                            callback.onError(StripeException.create(it))
+                            dispatchError(it, callback)
                         }
                     )
                 }
@@ -487,174 +460,27 @@ internal class StripePaymentController internal constructor(
         }
     }
 
-    private fun createPaymentIntentCallback(
-        requestOptions: ApiRequest.Options,
-        @StripeIntentResult.Outcome flowOutcome: Int,
-        sourceId: String,
-        shouldCancelSource: Boolean = false,
+    private suspend fun dispatchPaymentIntentResult(
+        paymentIntentResult: PaymentIntentResult,
         callback: ApiResultCallback<PaymentIntentResult>
-    ): ApiResultCallback<PaymentIntent> {
-        return object : ApiResultCallback<StripeIntent> {
-            override fun onSuccess(result: StripeIntent) {
-                if (result is PaymentIntent) {
-                    if (shouldCancelSource && result.requiresAction()) {
-                        logger.debug("Canceling source '$sourceId' for PaymentIntent")
-
-                        CoroutineScope(workContext).launch {
-                            val paymentIntentResult = runCatching {
-                                requireNotNull(
-                                    stripeRepository.cancelPaymentIntentSource(
-                                        result.id.orEmpty(),
-                                        sourceId,
-                                        requestOptions,
-                                    )
-                                )
-                            }
-
-                            withContext(Dispatchers.Main) {
-                                val paymentIntentCallback = createPaymentIntentCallback(
-                                    requestOptions,
-                                    flowOutcome,
-                                    sourceId,
-                                    false, // don't attempt to cancel source again!
-                                    callback
-                                )
-
-                                paymentIntentResult.fold(
-                                    onSuccess = paymentIntentCallback::onSuccess,
-                                    onFailure = {
-                                        paymentIntentCallback.onError(
-                                            StripeException.create(it)
-                                        )
-                                    }
-                                )
-                            }
-                        }
-                    } else {
-                        logger.debug("Dispatching PaymentIntentResult for ${result.id}")
-                        callback.onSuccess(
-                            PaymentIntentResult(result, flowOutcome, getFailureMessage(result, flowOutcome))
-                        )
-                    }
-                } else {
-                    callback.onError(
-                        IllegalArgumentException(
-                            "Expected a PaymentIntent, received a ${result.javaClass.simpleName}"
-                        )
-                    )
-                }
-            }
-
-            override fun onError(e: Exception) {
-                callback.onError(e)
-            }
-        }
+    ) = withContext(Dispatchers.Main) {
+        logger.debug("Dispatching PaymentIntentResult for ${paymentIntentResult.intent.id}")
+        callback.onSuccess(paymentIntentResult)
     }
 
-    private fun getFailureMessage(intent: StripeIntent, @StripeIntentResult.Outcome outcome: Int): String? {
-        return when {
-            intent.status == StripeIntent.Status.RequiresPaymentMethod -> {
-                when (intent) {
-                    is PaymentIntent -> {
-                        when {
-                            intent.lastPaymentError?.code == PaymentIntent.Error.CODE_AUTHENTICATION_ERROR -> {
-                                resources.getString(R.string.stripe_failure_reason_authentication)
-                            }
-                            intent.lastPaymentError?.type == PaymentIntent.Error.Type.CardError -> {
-                                intent.lastPaymentError.message
-                            }
-                            else -> {
-                                null
-                            }
-                        }
-                    }
-                    is SetupIntent -> {
-                        when {
-                            intent.lastSetupError?.code == SetupIntent.Error.CODE_AUTHENTICATION_ERROR -> {
-                                resources.getString(R.string.stripe_failure_reason_authentication)
-                            }
-                            intent.lastSetupError?.type == SetupIntent.Error.Type.CardError -> {
-                                intent.lastSetupError.message
-                            }
-                            else -> {
-                                null
-                            }
-                        }
-                    }
-                    else -> null
-                }
-            }
-            outcome == StripeIntentResult.Outcome.TIMEDOUT -> {
-                resources.getString(R.string.stripe_failure_reason_timed_out)
-            }
-            else -> {
-                null
-            }
-        }
-    }
-
-    private fun createSetupIntentCallback(
-        requestOptions: ApiRequest.Options,
-        @StripeIntentResult.Outcome flowOutcome: Int,
-        sourceId: String,
-        shouldCancelSource: Boolean = false,
+    private suspend fun dispatchSetupIntentResult(
+        setupIntentResult: SetupIntentResult,
         callback: ApiResultCallback<SetupIntentResult>
-    ): ApiResultCallback<SetupIntent> {
-        return object : ApiResultCallback<StripeIntent> {
-            override fun onSuccess(result: StripeIntent) {
-                if (result is SetupIntent) {
-                    if (shouldCancelSource && result.requiresAction()) {
-                        logger.debug("Canceling source '$sourceId' for SetupIntent")
+    ) = withContext(Dispatchers.Main) {
+        logger.debug("Dispatching SetupIntentResult for ${setupIntentResult.intent.id}")
+        callback.onSuccess(setupIntentResult)
+    }
 
-                        CoroutineScope(workContext).launch {
-                            val setupIntentResult = runCatching {
-                                requireNotNull(
-                                    stripeRepository.cancelSetupIntentSource(
-                                        result.id.orEmpty(),
-                                        sourceId,
-                                        requestOptions,
-                                    )
-                                )
-                            }
-
-                            withContext(Dispatchers.Main) {
-                                val setupIntentCallback = createSetupIntentCallback(
-                                    requestOptions,
-                                    flowOutcome,
-                                    sourceId,
-                                    false, // don't attempt to cancel source again!
-                                    callback
-                                )
-
-                                setupIntentResult.fold(
-                                    onSuccess = setupIntentCallback::onSuccess,
-                                    onFailure = {
-                                        setupIntentCallback.onError(
-                                            StripeException.create(it)
-                                        )
-                                    }
-                                )
-                            }
-                        }
-                    } else {
-                        logger.debug("Dispatching SetupIntentResult for ${result.id}")
-                        callback.onSuccess(
-                            SetupIntentResult(result, flowOutcome, getFailureMessage(result, flowOutcome))
-                        )
-                    }
-                } else {
-                    callback.onError(
-                        IllegalArgumentException(
-                            "Expected a SetupIntent, received a ${result.javaClass.simpleName}"
-                        )
-                    )
-                }
-            }
-
-            override fun onError(e: Exception) {
-                callback.onError(e)
-            }
-        }
+    private suspend fun dispatchError(
+        throwable: Throwable,
+        callback: ApiResultCallback<*>
+    ) = withContext(Dispatchers.Main) {
+        callback.onError(StripeException.create(throwable))
     }
 
     /**
@@ -686,7 +512,11 @@ internal class StripePaymentController internal constructor(
                             requestOptions
                         )
                     } catch (e: CertificateException) {
-                        handleError(host, getRequestCode(stripeIntent), e)
+                        handleError(
+                            paymentRelayStarterFactory(host),
+                            getRequestCode(stripeIntent),
+                            e
+                        )
                     }
                 }
                 is StripeIntent.NextActionData.SdkData.Use3DS1 -> {
@@ -699,7 +529,7 @@ internal class StripePaymentController internal constructor(
                         )
                     )
                     beginWebAuth(
-                        host,
+                        paymentAuthWebViewStarterFactory(host),
                         getRequestCode(stripeIntent),
                         stripeIntent.clientSecret.orEmpty(),
                         nextActionData.url,
@@ -720,7 +550,7 @@ internal class StripePaymentController internal constructor(
                     )
 
                     beginWebAuth(
-                        host,
+                        paymentAuthWebViewStarterFactory(host),
                         getRequestCode(stripeIntent),
                         stripeIntent.clientSecret.orEmpty(),
                         nextActionData.url.toString(),
@@ -746,7 +576,7 @@ internal class StripePaymentController internal constructor(
                     )
 
                     beginWebAuth(
-                        host,
+                        paymentAuthWebViewStarterFactory(host),
                         getRequestCode(stripeIntent),
                         stripeIntent.clientSecret.orEmpty(),
                         nextActionData.webViewUrl.toString(),
@@ -759,7 +589,7 @@ internal class StripePaymentController internal constructor(
                     // TODO(smaskell): add analytics event
                     if (nextActionData.hostedVoucherUrl != null) {
                         beginWebAuth(
-                            host,
+                            paymentAuthWebViewStarterFactory(host),
                             getRequestCode(stripeIntent),
                             stripeIntent.clientSecret.orEmpty(),
                             nextActionData.hostedVoucherUrl,
@@ -790,13 +620,16 @@ internal class StripePaymentController internal constructor(
         }
     }
 
-    private fun bypassAuth(
+    @JvmSynthetic
+    internal fun bypassAuth(
         host: AuthActivityStarter.Host,
         stripeIntent: StripeIntent,
         stripeAccountId: String?
     ) {
-        PaymentRelayStarter.create(host, getRequestCode(stripeIntent))
-            .start(PaymentRelayStarter.Args.create(stripeIntent, stripeAccountId))
+        paymentRelayStarterFactory(host)
+            .start(
+                PaymentRelayStarter.Args.create(stripeIntent, stripeAccountId)
+            )
     }
 
     private fun bypassAuth(
@@ -804,8 +637,10 @@ internal class StripePaymentController internal constructor(
         source: Source,
         stripeAccountId: String?
     ) {
-        PaymentRelayStarter.create(host, SOURCE_REQUEST_CODE)
-            .start(PaymentRelayStarter.Args.create(source, stripeAccountId))
+        paymentRelayStarterFactory(host)
+            .start(
+                PaymentRelayStarter.Args.SourceArgs(source, stripeAccountId)
+            )
     }
 
     private fun begin3ds2Auth(
@@ -822,18 +657,7 @@ internal class StripePaymentController internal constructor(
             stripe3ds2Fingerprint.directoryServerName,
             stripe3ds2Fingerprint.directoryServerEncryption.rootCerts,
             stripe3ds2Fingerprint.directoryServerEncryption.directoryServerPublicKey,
-            stripe3ds2Fingerprint.directoryServerEncryption.keyId,
-            challengeCompletionIntent = Intent(activity, Stripe3ds2CompletionActivity::class.java)
-                .putExtra(
-                    Stripe3ds2CompletionActivity.EXTRA_CLIENT_SECRET,
-                    stripeIntent.clientSecret
-                )
-                .putExtra(
-                    Stripe3ds2CompletionActivity.EXTRA_STRIPE_ACCOUNT,
-                    requestOptions.stripeAccount
-                )
-                .addFlags(Intent.FLAG_ACTIVITY_FORWARD_RESULT),
-            challengeCompletionRequestCode = getRequestCode(stripeIntent)
+            stripe3ds2Fingerprint.directoryServerEncryption.keyId
         )
 
         challengeProgressActivityStarter.start(
@@ -872,11 +696,7 @@ internal class StripePaymentController internal constructor(
                 )
             }
 
-            val paymentRelayStarter = PaymentRelayStarter.create(
-                host,
-                getRequestCode(stripeIntent)
-            )
-
+            val paymentRelayStarter = paymentRelayStarterFactory(host)
             start3ds2AuthResult.fold(
                 onSuccess = { authResult ->
                     on3ds2AuthSuccess(
@@ -885,13 +705,18 @@ internal class StripePaymentController internal constructor(
                         stripe3ds2Fingerprint.source,
                         timeout,
                         paymentRelayStarter,
+                        getRequestCode(stripeIntent),
                         host,
                         stripeIntent,
                         requestOptions
                     )
                 },
                 onFailure = { throwable ->
-                    on3ds2AuthFailure(throwable, paymentRelayStarter)
+                    on3ds2AuthFailure(
+                        throwable,
+                        getRequestCode(stripeIntent),
+                        paymentRelayStarter
+                    )
                 }
             )
         }
@@ -904,6 +729,7 @@ internal class StripePaymentController internal constructor(
         sourceId: String,
         timeout: Int,
         paymentRelayStarter: PaymentRelayStarter,
+        requestCode: Int,
         host: AuthActivityStarter.Host,
         stripeIntent: StripeIntent,
         requestOptions: ApiRequest.Options
@@ -928,23 +754,11 @@ internal class StripePaymentController internal constructor(
                 )
             }
         } else if (result.fallbackRedirectUrl != null) {
-            analyticsRequestExecutor.executeAsync(
-                analyticsRequestFactory.create(
-                    analyticsDataFactory.createAuthParams(
-                        AnalyticsEvent.Auth3ds2Fallback,
-                        stripeIntent.id.orEmpty()
-                    )
-                )
-            )
-            beginWebAuth(
-                host,
-                getRequestCode(stripeIntent),
-                stripeIntent.clientSecret.orEmpty(),
+            on3ds2AuthFallback(
                 result.fallbackRedirectUrl,
-                requestOptions.stripeAccount,
-                enableLogging = enableLogging,
-                // 3D-Secure requires cancelling the source when the user cancels auth (AUTHN-47)
-                shouldCancelSource = true
+                host,
+                stripeIntent,
+                requestOptions
             )
         } else {
             val error = result.error
@@ -962,9 +776,39 @@ internal class StripePaymentController internal constructor(
                 RuntimeException(
                     "Error encountered during 3DS2 authentication request. $errorMessage"
                 ),
+                requestCode,
                 paymentRelayStarter
             )
         }
+    }
+
+    /**
+     * Used when standard 3DS2 authentication mechanisms are unavailable.
+     */
+    internal fun on3ds2AuthFallback(
+        fallbackRedirectUrl: String,
+        host: AuthActivityStarter.Host,
+        stripeIntent: StripeIntent,
+        requestOptions: ApiRequest.Options
+    ) {
+        analyticsRequestExecutor.executeAsync(
+            analyticsRequestFactory.create(
+                analyticsDataFactory.createAuthParams(
+                    AnalyticsEvent.Auth3ds2Fallback,
+                    stripeIntent.id.orEmpty()
+                )
+            )
+        )
+        beginWebAuth(
+            paymentAuthWebViewStarterFactory(host),
+            getRequestCode(stripeIntent),
+            stripeIntent.clientSecret.orEmpty(),
+            fallbackRedirectUrl,
+            requestOptions.stripeAccount,
+            enableLogging = enableLogging,
+            // 3D-Secure requires cancelling the source when the user cancels auth (AUTHN-47)
+            shouldCancelSource = true
+        )
     }
 
     private suspend fun startFrictionlessFlow(
@@ -979,7 +823,9 @@ internal class StripePaymentController internal constructor(
                 )
             )
         )
-        paymentRelayStarter.start(PaymentRelayStarter.Args.create(stripeIntent))
+        paymentRelayStarter.start(
+            PaymentRelayStarter.Args.create(stripeIntent)
+        )
     }
 
     @VisibleForTesting
@@ -1014,7 +860,8 @@ internal class StripePaymentController internal constructor(
                         threeDsServerTransactionId = ares.threeDSServerTransId,
                         acsTransactionId = ares.acsTransId
                     ),
-                    PaymentAuth3ds2ChallengeStatusReceiver.create(
+                    PaymentAuth3ds2ChallengeStatusReceiver(
+                        stripe3ds2CompletionStarterFactory(host, getRequestCode(stripeIntent)),
                         stripeRepository,
                         stripeIntent,
                         sourceId,
@@ -1023,7 +870,7 @@ internal class StripePaymentController internal constructor(
                         analyticsDataFactory,
                         transaction,
                         analyticsRequestFactory,
-                        workContext
+                        workContext = workContext
                     ),
                     maxTimeout
                 )
@@ -1031,6 +878,7 @@ internal class StripePaymentController internal constructor(
             onFailure = {
                 on3ds2AuthFailure(
                     it,
+                    getRequestCode(stripeIntent),
                     paymentRelayStarter
                 )
             }
@@ -1039,16 +887,19 @@ internal class StripePaymentController internal constructor(
 
     private suspend fun on3ds2AuthFailure(
         throwable: Throwable,
+        requestCode: Int,
         paymentRelayStarter: PaymentRelayStarter
     ) = withContext(Dispatchers.Main) {
         paymentRelayStarter.start(
-            PaymentRelayStarter.Args.create(
-                StripeException.create(throwable)
+            PaymentRelayStarter.Args.ErrorArgs(
+                StripeException.create(throwable),
+                requestCode
             )
         )
     }
 
     private class ConfirmStripeIntentCallback constructor(
+        private val paymentRelayStarter: PaymentRelayStarter,
         private val host: AuthActivityStarter.Host,
         private val requestOptions: ApiRequest.Options,
         private val paymentController: PaymentController,
@@ -1060,11 +911,16 @@ internal class StripePaymentController internal constructor(
         }
 
         override fun onError(e: Exception) {
-            handleError(host, requestCode, e)
+            handleError(
+                paymentRelayStarter,
+                requestCode,
+                e
+            )
         }
     }
 
     internal class PaymentAuth3ds2ChallengeStatusReceiver internal constructor(
+        private val stripe3ds2CompletionStarter: Stripe3ds2CompletionStarter,
         private val stripeRepository: StripeRepository,
         private val stripeIntent: StripeIntent,
         private val sourceId: String,
@@ -1079,9 +935,9 @@ internal class StripePaymentController internal constructor(
         override fun completed(
             completionEvent: CompletionEvent,
             uiTypeCode: String,
-            onReceiverCompleted: () -> Unit
+            flowOutcome: ChallengeFlowOutcome
         ) {
-            super.completed(completionEvent, uiTypeCode, onReceiverCompleted)
+            super.completed(completionEvent, uiTypeCode, flowOutcome)
             analyticsRequestExecutor.executeAsync(
                 analyticsRequestFactory.create(
                     analyticsDataFactory.create3ds2ChallengeParams(
@@ -1091,14 +947,13 @@ internal class StripePaymentController internal constructor(
                     )
                 )
             )
-            notifyCompletion(onReceiverCompleted)
+            complete3ds2Auth(flowOutcome)
         }
 
         override fun cancelled(
-            uiTypeCode: String,
-            onReceiverCompleted: () -> Unit
+            uiTypeCode: String
         ) {
-            super.cancelled(uiTypeCode, onReceiverCompleted)
+            super.cancelled(uiTypeCode)
             analyticsRequestExecutor.executeAsync(
                 analyticsRequestFactory.create(
                     analyticsDataFactory.create3ds2ChallengeParams(
@@ -1108,14 +963,13 @@ internal class StripePaymentController internal constructor(
                     )
                 )
             )
-            notifyCompletion(onReceiverCompleted)
+            complete3ds2Auth(ChallengeFlowOutcome.Cancel)
         }
 
         override fun timedout(
-            uiTypeCode: String,
-            onReceiverCompleted: () -> Unit
+            uiTypeCode: String
         ) {
-            super.timedout(uiTypeCode, onReceiverCompleted)
+            super.timedout(uiTypeCode)
             analyticsRequestExecutor.executeAsync(
                 analyticsRequestFactory.create(
                     analyticsDataFactory.create3ds2ChallengeParams(
@@ -1125,14 +979,13 @@ internal class StripePaymentController internal constructor(
                     )
                 )
             )
-            notifyCompletion(onReceiverCompleted)
+            complete3ds2Auth(ChallengeFlowOutcome.Timeout)
         }
 
         override fun protocolError(
-            protocolErrorEvent: ProtocolErrorEvent,
-            onReceiverCompleted: () -> Unit
+            protocolErrorEvent: ProtocolErrorEvent
         ) {
-            super.protocolError(protocolErrorEvent, onReceiverCompleted)
+            super.protocolError(protocolErrorEvent)
             analyticsRequestExecutor.executeAsync(
                 analyticsRequestFactory.create(
                     analyticsDataFactory.create3ds2ChallengeErrorParams(
@@ -1141,14 +994,13 @@ internal class StripePaymentController internal constructor(
                     )
                 )
             )
-            notifyCompletion(onReceiverCompleted)
+            complete3ds2Auth(ChallengeFlowOutcome.ProtocolError)
         }
 
         override fun runtimeError(
-            runtimeErrorEvent: RuntimeErrorEvent,
-            onReceiverCompleted: () -> Unit
+            runtimeErrorEvent: RuntimeErrorEvent
         ) {
-            super.runtimeError(runtimeErrorEvent, onReceiverCompleted)
+            super.runtimeError(runtimeErrorEvent)
             analyticsRequestExecutor.executeAsync(
                 analyticsRequestFactory.create(
                     analyticsDataFactory.create3ds2ChallengeErrorParams(
@@ -1157,10 +1009,10 @@ internal class StripePaymentController internal constructor(
                     )
                 )
             )
-            notifyCompletion(onReceiverCompleted)
+            complete3ds2Auth(ChallengeFlowOutcome.RuntimeError)
         }
 
-        private fun notifyCompletion(completed3ds2Callback: () -> Unit) {
+        private fun complete3ds2Auth(flowOutcome: ChallengeFlowOutcome) {
             analyticsRequestExecutor.executeAsync(
                 analyticsRequestFactory.create(
                     analyticsDataFactory.create3ds2ChallengeParams(
@@ -1180,35 +1032,31 @@ internal class StripePaymentController internal constructor(
                 }
 
                 withContext(Dispatchers.Main) {
-                    completed3ds2Callback()
+                    startCompletionActivity(flowOutcome)
                 }
             }
         }
 
-        internal companion object {
-            internal fun create(
-                stripeRepository: StripeRepository,
-                stripeIntent: StripeIntent,
-                sourceId: String,
-                requestOptions: ApiRequest.Options,
-                analyticsRequestExecutor: AnalyticsRequestExecutor,
-                analyticsDataFactory: AnalyticsDataFactory,
-                transaction: Transaction,
-                analyticsRequestFactory: AnalyticsRequest.Factory,
-                workContext: CoroutineContext
-            ): PaymentAuth3ds2ChallengeStatusReceiver {
-                return PaymentAuth3ds2ChallengeStatusReceiver(
-                    stripeRepository,
-                    stripeIntent,
-                    sourceId,
-                    requestOptions,
-                    analyticsRequestExecutor,
-                    analyticsDataFactory,
-                    transaction,
-                    analyticsRequestFactory,
-                    workContext
+        private fun startCompletionActivity(flowOutcome: ChallengeFlowOutcome) {
+            stripe3ds2CompletionStarter.start(
+                PaymentFlowResult.Unvalidated(
+                    clientSecret = stripeIntent.clientSecret.orEmpty(),
+                    stripeAccountId = requestOptions.stripeAccount,
+                    flowOutcome = when (flowOutcome) {
+                        ChallengeFlowOutcome.CompleteSuccessful ->
+                            StripeIntentResult.Outcome.SUCCEEDED
+                        ChallengeFlowOutcome.Cancel ->
+                            StripeIntentResult.Outcome.CANCELED
+                        ChallengeFlowOutcome.Timeout ->
+                            StripeIntentResult.Outcome.TIMEDOUT
+                        ChallengeFlowOutcome.CompleteUnsuccessful,
+                        ChallengeFlowOutcome.ProtocolError,
+                        ChallengeFlowOutcome.RuntimeError ->
+                            StripeIntentResult.Outcome.FAILED
+                        else -> StripeIntentResult.Outcome.UNKNOWN
+                    }
                 )
-            }
+            )
         }
     }
 
@@ -1277,11 +1125,9 @@ internal class StripePaymentController internal constructor(
 
         /**
          * Start in-app WebView activity.
-         *
-         * @param host the payment authentication result will be returned as a result to this view host
          */
         private fun beginWebAuth(
-            host: AuthActivityStarter.Host,
+            paymentWebWebViewStarter: PaymentAuthWebViewStarter,
             requestCode: Int,
             clientSecret: String,
             authUrl: String,
@@ -1292,9 +1138,9 @@ internal class StripePaymentController internal constructor(
             shouldCancelIntentOnUserNavigation: Boolean = true
         ) {
             Logger.getInstance(enableLogging).debug("PaymentAuthWebViewStarter#start()")
-            val starter = PaymentAuthWebViewStarter(host, requestCode)
-            starter.start(
-                PaymentAuthWebViewStarter.Args(
+            paymentWebWebViewStarter.start(
+                PaymentAuthWebViewContract.Args(
+                    requestCode,
                     clientSecret,
                     authUrl,
                     returnUrl,
@@ -1325,14 +1171,15 @@ internal class StripePaymentController internal constructor(
         }
 
         private fun handleError(
-            host: AuthActivityStarter.Host,
+            paymentRelayStarter: PaymentRelayStarter,
             requestCode: Int,
             throwable: Throwable
         ) {
-            PaymentRelayStarter.create(host, requestCode)
+            paymentRelayStarter
                 .start(
-                    PaymentRelayStarter.Args.create(
-                        StripeException.create(throwable)
+                    PaymentRelayStarter.Args.ErrorArgs(
+                        StripeException.create(throwable),
+                        requestCode
                     )
                 )
         }
@@ -1353,16 +1200,9 @@ internal class StripePaymentController internal constructor(
             )
         }
 
-        @JvmSynthetic
-        internal fun getClientSecret(data: Intent): String? {
-            return PaymentController.Result.fromIntent(data)?.clientSecret
-        }
-
         private val EXPAND_PAYMENT_METHOD = listOf("payment_method")
         internal val CHALLENGE_DELAY = TimeUnit.SECONDS.toMillis(2L)
 
         private const val REQUIRED_ERROR = "API request returned an invalid response."
-
-        private const val CLIENT_SECRET_INTENT_ERROR = "Invalid client_secret value in result Intent."
     }
 }

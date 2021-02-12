@@ -1,5 +1,29 @@
 # CHANGELOG
 
+## 16.3.0 - 2021-02-11
+* [#3334](https://github.com/stripe/stripe-android/pull/3334) Upgrade Kotlin to `1.4.30`
+* [#3346](https://github.com/stripe/stripe-android/pull/3346) Upgrade Gradle to `6.8.2`
+* [#3349](https://github.com/stripe/stripe-android/pull/3349) Upgrade `material-components` to `1.3.0`
+* [#3359](https://github.com/stripe/stripe-android/pull/3359) Add `brand` and `last4` properties to `CardParams`
+* [#3367](https://github.com/stripe/stripe-android/pull/3367) Upgrade `fragment-ktx` to `1.3.0` and `activity-ktx` to `1.2.0`
+* [#3368](https://github.com/stripe/stripe-android/pull/3368) Upgrade `androidx.lifecycle` dependencies to `2.3.0`
+* [#3372](https://github.com/stripe/stripe-android/pull/3372) Upgrade 3DS2 SDK to `5.2.0`
+    * Upgrade `nimbus-jose-jwt` to `9.5`
+    * Upgrade Kotlin to `1.4.30`
+    * Upgrade `material-components` to `1.3.0`
+    * Upgrade `activity-ktx` to `1.2.0` and `fragment-ktx` to `1.3.0`
+    * Upgrade `androidx.lifecycle` to `2.3.0`
+    * Migrate `ProgressBar` to `CircularProgressIndicator`
+
+## 16.2.1 - 2021-01-29
+* [#3275](https://github.com/stripe/stripe-android/pull/3257) Fix spinner positioning in `CardMultilineWidget`
+* [#3275](https://github.com/stripe/stripe-android/pull/3275) Upgrade Android Gradle Plugin to `4.1.2`
+* [#3291](https://github.com/stripe/stripe-android/pull/3291) Upgrade Gradle to `6.8.1`
+* [#3300](https://github.com/stripe/stripe-android/pull/3300) Upgrade AndroidX fragment dependency to `1.3.0-rc2`
+* [#3302](https://github.com/stripe/stripe-android/pull/3302) Add support for creating `afterpay_clearpay` payment methods
+* [#3315](https://github.com/stripe/stripe-android/pull/3315) Upgrade 3DS2 SDK to `5.1.1`
+    * Upgrade `nimbus-jose-jwt` to `9.4.2`
+
 ## 16.2.0 - 2021-01-11
 * [#3088](https://github.com/stripe/stripe-android/pull/3088) Mark some builders in `PaymentMethodCreateParams` as deprecated
 * [#3134](https://github.com/stripe/stripe-android/pull/3134) Upgrade Kotlin to `1.4.21`

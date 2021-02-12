@@ -1,7 +1,5 @@
 package com.stripe.android.paymentsheet
 
-import android.os.Bundle
-import android.view.View
 import androidx.fragment.app.activityViewModels
 import com.stripe.android.R
 import com.stripe.android.paymentsheet.analytics.EventReporter
@@ -9,7 +7,10 @@ import com.stripe.android.paymentsheet.model.PaymentSelection
 
 internal class PaymentOptionsListFragment(
     eventReporter: EventReporter
-) : BasePaymentMethodsListFragment(eventReporter) {
+) : BasePaymentMethodsListFragment(
+    canClickSelectedItem = true,
+    eventReporter
+) {
     private val activityViewModel by activityViewModels<PaymentOptionsViewModel> {
         PaymentOptionsViewModel.Factory(
             { requireActivity().application },
@@ -25,14 +26,11 @@ internal class PaymentOptionsListFragment(
 
     override fun transitionToAddPaymentMethod() {
         activityViewModel.transitionTo(
-            PaymentOptionsViewModel.TransitionTarget.AddPaymentMethodFull
+            PaymentOptionsViewModel.TransitionTarget.AddPaymentMethodFull(config)
         )
     }
 
-    override fun onViewCreated(view: View, savedInstanceState: Bundle?) {
-        super.onViewCreated(view, savedInstanceState)
-        viewBinding.header.setText(R.string.stripe_paymentsheet_select_payment_method)
-    }
+    override fun createHeaderText() = getString(R.string.stripe_paymentsheet_select_payment_method)
 
     override fun onPaymentOptionSelected(
         paymentSelection: PaymentSelection,
@@ -41,7 +39,7 @@ internal class PaymentOptionsListFragment(
         super.onPaymentOptionSelected(paymentSelection, isClick)
         if (isClick) {
             // this is a click-triggered selection
-            sheetViewModel.onUserSelection(paymentSelection)
+            sheetViewModel.onUserSelection()
         }
     }
 }

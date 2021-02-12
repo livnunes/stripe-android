@@ -5,21 +5,18 @@ import androidx.lifecycle.MediatorLiveData
 import androidx.lifecycle.MutableLiveData
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.distinctUntilChanged
-import androidx.lifecycle.liveData
 import androidx.lifecycle.switchMap
 import androidx.lifecycle.viewModelScope
 import com.stripe.android.googlepay.StripeGooglePayContract
 import com.stripe.android.model.PaymentIntent
 import com.stripe.android.model.PaymentMethod
-import com.stripe.android.paymentsheet.GooglePayRepository
 import com.stripe.android.paymentsheet.PaymentSheet
 import com.stripe.android.paymentsheet.PrefsRepository
-import com.stripe.android.paymentsheet.model.AddPaymentMethodConfig
+import com.stripe.android.paymentsheet.model.FragmentConfig
 import com.stripe.android.paymentsheet.model.PaymentSelection
+import com.stripe.android.paymentsheet.model.SavedSelection
 import com.stripe.android.paymentsheet.ui.SheetMode
 import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.flow.filterNotNull
-import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import kotlin.coroutines.CoroutineContext
@@ -27,10 +24,8 @@ import kotlin.coroutines.CoroutineContext
 /**
  * Base `ViewModel` for activities that use `BottomSheet`.
  */
-internal abstract class SheetViewModel<TransitionTargetType, ViewStateType>(
+internal abstract class SheetViewModel<TransitionTargetType>(
     internal val config: PaymentSheet.Configuration?,
-    private val isGooglePayEnabled: Boolean,
-    private val googlePayRepository: GooglePayRepository,
     protected val prefsRepository: PrefsRepository,
     protected val workContext: CoroutineContext = Dispatchers.IO
 ) : ViewModel() {
@@ -40,7 +35,7 @@ internal abstract class SheetViewModel<TransitionTargetType, ViewStateType>(
     private val _fatal = MutableLiveData<Throwable>()
     internal val fatal: LiveData<Throwable> = _fatal
 
-    private val _isGooglePayReady = MutableLiveData<Boolean>()
+    protected val _isGooglePayReady = MutableLiveData<Boolean>()
     internal val isGooglePayReady: LiveData<Boolean> = _isGooglePayReady.distinctUntilChanged()
 
     protected val _launchGooglePay = MutableLiveData<StripeGooglePayContract.Args>()
@@ -51,6 +46,9 @@ internal abstract class SheetViewModel<TransitionTargetType, ViewStateType>(
 
     protected val _paymentMethods = MutableLiveData<List<PaymentMethod>>()
     internal val paymentMethods: LiveData<List<PaymentMethod>> = _paymentMethods
+
+    private val _savedSelection = MutableLiveData<SavedSelection>()
+    private val savedSelection: LiveData<SavedSelection> = _savedSelection
 
     private val _transition = MutableLiveData<TransitionTargetType?>(null)
     internal val transition: LiveData<TransitionTargetType?> = _transition
@@ -64,12 +62,11 @@ internal abstract class SheetViewModel<TransitionTargetType, ViewStateType>(
     protected val _processing = MutableLiveData(true)
     val processing: LiveData<Boolean> = _processing
 
-    protected val _viewState = MutableLiveData<ViewStateType>(null)
-    internal val viewState: LiveData<ViewStateType> = _viewState.distinctUntilChanged()
-
     // a message shown to the user
     protected val _userMessage = MutableLiveData<UserMessage?>()
     internal val userMessage: LiveData<UserMessage?> = _userMessage
+
+    abstract val newCard: PaymentSelection.New.Card?
 
     val ctaEnabled: LiveData<Boolean> = processing.switchMap { isProcessing ->
         transition.switchMap { transitionTarget ->
@@ -82,54 +79,42 @@ internal abstract class SheetViewModel<TransitionTargetType, ViewStateType>(
     }
 
     init {
-        fetchIsGooglePayReady()
+        fetchSavedSelection()
     }
 
-    fun fetchAddPaymentMethodConfig() = liveData {
-        emitSource(
-            MediatorLiveData<AddPaymentMethodConfig?>().also { configLiveData ->
-                listOf(paymentIntent, paymentMethods, isGooglePayReady).forEach { source ->
-                    configLiveData.addSource(source) {
-                        configLiveData.value = createAddPaymentMethodConfig()
-                    }
-                }
-            }.distinctUntilChanged()
-        )
-    }
+    fun fetchFragmentConfig() = MediatorLiveData<FragmentConfig?>().also { configLiveData ->
+        listOf(
+            savedSelection,
+            paymentIntent,
+            paymentMethods,
+            isGooglePayReady
+        ).forEach { source ->
+            configLiveData.addSource(source) {
+                configLiveData.value = createFragmentConfig()
+            }
+        }
+    }.distinctUntilChanged()
 
-    private fun createAddPaymentMethodConfig(): AddPaymentMethodConfig? {
+    private fun createFragmentConfig(): FragmentConfig? {
         val paymentIntentValue = paymentIntent.value
         val paymentMethodsValue = paymentMethods.value
         val isGooglePayReadyValue = isGooglePayReady.value
+        val savedSelectionValue = savedSelection.value
 
         return if (
             paymentIntentValue != null &&
             paymentMethodsValue != null &&
-            isGooglePayReadyValue != null
+            isGooglePayReadyValue != null &&
+            savedSelectionValue != null
         ) {
-            AddPaymentMethodConfig(
+            FragmentConfig(
                 paymentIntent = paymentIntentValue,
                 paymentMethods = paymentMethodsValue,
-                isGooglePayReady = isGooglePayReadyValue
+                isGooglePayReady = isGooglePayReadyValue,
+                savedSelection = savedSelectionValue
             )
         } else {
             null
-        }
-    }
-
-    fun fetchIsGooglePayReady() {
-        if (isGooglePayReady.value == null) {
-            if (isGooglePayEnabled) {
-                viewModelScope.launch {
-                    withContext(workContext) {
-                        _isGooglePayReady.postValue(
-                            googlePayRepository.isReady().filterNotNull().first()
-                        )
-                    }
-                }
-            } else {
-                _isGooglePayReady.value = false
-            }
         }
     }
 
@@ -159,12 +144,13 @@ internal abstract class SheetViewModel<TransitionTargetType, ViewStateType>(
         _userMessage.value = null
     }
 
-    fun getDefaultPaymentMethodId() = liveData {
-        emit(
-            withContext(workContext) {
-                prefsRepository.getDefaultPaymentMethodId()
+    private fun fetchSavedSelection() {
+        viewModelScope.launch {
+            val savedSelection = withContext(workContext) {
+                prefsRepository.getSavedSelection()
             }
-        )
+            _savedSelection.value = savedSelection
+        }
     }
 
     sealed class UserMessage {

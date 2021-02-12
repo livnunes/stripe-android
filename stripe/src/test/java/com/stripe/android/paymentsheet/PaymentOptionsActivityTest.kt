@@ -2,6 +2,7 @@ package com.stripe.android.paymentsheet
 
 import android.content.Intent
 import androidx.arch.core.executor.testing.InstantTaskExecutorRule
+import androidx.core.os.bundleOf
 import androidx.core.view.isVisible
 import androidx.test.core.app.ApplicationProvider
 import com.google.common.truth.Truth.assertThat
@@ -25,7 +26,6 @@ import org.junit.Rule
 import org.junit.Test
 import org.junit.runner.RunWith
 import org.robolectric.RobolectricTestRunner
-import org.robolectric.Shadows
 import kotlin.test.AfterTest
 import kotlin.test.BeforeTest
 
@@ -43,10 +43,11 @@ class PaymentOptionsActivityTest {
             paymentIntent = PaymentIntentFixtures.PI_REQUIRES_PAYMENT_METHOD,
             paymentMethods = emptyList(),
             sessionId = SessionId(),
-            config = PaymentSheetFixtures.CONFIG_GOOGLEPAY
+            config = PaymentSheetFixtures.CONFIG_GOOGLEPAY,
+            isGooglePayReady = false,
+            newCard = null
         ),
-        googlePayRepository = FakeGooglePayRepository(false),
-        prefsRepository = mock(),
+        prefsRepository = FakePrefsRepository(),
         eventReporter = eventReporter
     )
 
@@ -76,14 +77,14 @@ class PaymentOptionsActivityTest {
             viewModel.updateMode(SheetMode.Wrapped)
 
             activity.viewBinding.root.performClick()
-            idleLooper()
-
-            assertThat(
-                PaymentOptionResult.fromIntent(Shadows.shadowOf(activity).resultIntent)
-            ).isEqualTo(
-                PaymentOptionResult.Cancelled(null)
-            )
+            activity.finish()
         }
+
+        assertThat(
+            PaymentOptionResult.fromIntent(scenario.getResult().resultData)
+        ).isEqualTo(
+            PaymentOptionResult.Canceled(null)
+        )
     }
 
     @Test
@@ -126,13 +127,17 @@ class PaymentOptionsActivityTest {
         return Intent(
             ApplicationProvider.getApplicationContext(),
             PaymentOptionsActivity::class.java
-        ).putExtra(
-            ActivityStarter.Args.EXTRA,
-            PaymentOptionContract.Args(
-                paymentIntent = PaymentIntentFixtures.PI_REQUIRES_PAYMENT_METHOD,
-                paymentMethods = paymentMethods,
-                sessionId = SessionId(),
-                config = PaymentSheetFixtures.CONFIG_GOOGLEPAY
+        ).putExtras(
+            bundleOf(
+                ActivityStarter.Args.EXTRA to
+                    PaymentOptionContract.Args(
+                        paymentIntent = PaymentIntentFixtures.PI_REQUIRES_PAYMENT_METHOD,
+                        paymentMethods = paymentMethods,
+                        sessionId = SessionId(),
+                        config = PaymentSheetFixtures.CONFIG_GOOGLEPAY,
+                        isGooglePayReady = false,
+                        newCard = null
+                    )
             )
         )
     }

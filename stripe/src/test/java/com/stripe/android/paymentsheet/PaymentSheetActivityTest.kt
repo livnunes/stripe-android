@@ -1,7 +1,6 @@
 package com.stripe.android.paymentsheet
 
 import android.content.Context
-import android.content.Intent
 import android.view.ViewGroup.LayoutParams.MATCH_PARENT
 import android.view.ViewGroup.LayoutParams.WRAP_CONTENT
 import androidx.arch.core.executor.testing.InstantTaskExecutorRule
@@ -12,25 +11,24 @@ import com.google.common.truth.Truth.assertThat
 import com.nhaarman.mockitokotlin2.mock
 import com.stripe.android.ApiKeyFixtures
 import com.stripe.android.PaymentConfiguration
-import com.stripe.android.PaymentController
+import com.stripe.android.PaymentIntentResult
 import com.stripe.android.StripeIntentResult
-import com.stripe.android.StripePaymentController
 import com.stripe.android.model.ConfirmPaymentIntentParams
-import com.stripe.android.model.ListPaymentMethodsParams
-import com.stripe.android.model.PaymentIntent
 import com.stripe.android.model.PaymentIntentFixtures
-import com.stripe.android.model.PaymentMethod
 import com.stripe.android.model.PaymentMethodFixtures
-import com.stripe.android.networking.AbsFakeStripeRepository
-import com.stripe.android.networking.ApiRequest
+import com.stripe.android.model.StripeIntent
+import com.stripe.android.payments.FakePaymentFlowResultProcessor
+import com.stripe.android.payments.PaymentFlowResult
 import com.stripe.android.paymentsheet.analytics.EventReporter
 import com.stripe.android.paymentsheet.analytics.SessionId
+import com.stripe.android.paymentsheet.model.FragmentConfigFixtures
 import com.stripe.android.paymentsheet.model.PaymentSelection
+import com.stripe.android.paymentsheet.repositories.PaymentIntentRepository
+import com.stripe.android.paymentsheet.repositories.PaymentMethodsRepository
 import com.stripe.android.utils.InjectableActivityScenario
 import com.stripe.android.utils.TestUtils.idleLooper
 import com.stripe.android.utils.TestUtils.viewModelFactoryFor
 import com.stripe.android.utils.injectableActivityScenario
-import com.stripe.android.view.PaymentRelayActivity
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.test.TestCoroutineDispatcher
@@ -40,7 +38,6 @@ import org.junit.Rule
 import org.junit.Test
 import org.junit.runner.RunWith
 import org.robolectric.RobolectricTestRunner
-import org.robolectric.Shadows.shadowOf
 import kotlin.test.AfterTest
 import kotlin.test.BeforeTest
 
@@ -53,28 +50,21 @@ internal class PaymentSheetActivityTest {
     private val context = ApplicationProvider.getApplicationContext<Context>()
     private val testDispatcher = TestCoroutineDispatcher()
 
-    private val paymentMethods = listOf(
-        PaymentMethod("payment_method_id", 0, false, PaymentMethod.Type.Card)
-    )
-
+    private val paymentFlowResultProcessor = FakePaymentFlowResultProcessor()
     private val googlePayRepository = FakeGooglePayRepository(true)
-    private val stripeRepository = FakeStripeRepository(PAYMENT_INTENT, paymentMethods)
     private val eventReporter = mock<EventReporter>()
 
     private val viewModel = PaymentSheetViewModel(
         publishableKey = ApiKeyFixtures.FAKE_PUBLISHABLE_KEY,
         stripeAccountId = null,
-        stripeRepository = stripeRepository,
-        paymentController = StripePaymentController(
-            context,
-            ApiKeyFixtures.FAKE_PUBLISHABLE_KEY,
-            stripeRepository,
-            workContext = testDispatcher
-        ),
+        paymentIntentRepository = PaymentIntentRepository.Static(PAYMENT_INTENT),
+        paymentMethodsRepository = PaymentMethodsRepository.Static(PAYMENT_METHODS),
+        paymentFlowResultProcessor = paymentFlowResultProcessor,
         googlePayRepository = googlePayRepository,
-        prefsRepository = mock(),
+        prefsRepository = FakePrefsRepository(),
         eventReporter = eventReporter,
         args = PaymentSheetFixtures.ARGS_CUSTOMER_WITH_GOOGLEPAY,
+        animateOutMillis = 0,
         workContext = testDispatcher
     )
 
@@ -120,22 +110,27 @@ internal class PaymentSheetActivityTest {
 
             assertThat(activity.bottomSheetBehavior.state)
                 .isEqualTo(BottomSheetBehavior.STATE_HIDDEN)
-            assertThat(
-                contract.parseResult(0, shadowOf(activity).resultIntent)
-            ).isEqualTo(
-                PaymentResult.Cancelled(
-                    null,
-                    PAYMENT_INTENT
-                )
-            )
         }
+
+        assertThat(
+            contract.parseResult(
+                scenario.getResult().resultCode,
+                scenario.getResult().resultData
+            )
+        ).isEqualTo(
+            PaymentResult.Canceled(
+                null,
+                PAYMENT_INTENT
+            )
+        )
     }
 
     @Test
     fun `updates buy button state`() {
         val scenario = activityScenario()
         scenario.launch(intent).onActivity { activity ->
-            assertThat(activity.viewBinding.buyButton.isEnabled).isFalse()
+            assertThat(activity.viewBinding.buyButton.isEnabled)
+                .isTrue()
 
             viewModel.updateSelection(PaymentSelection.GooglePay)
             assertThat(activity.viewBinding.buyButton.isEnabled).isTrue()
@@ -162,7 +157,11 @@ internal class PaymentSheetActivityTest {
             assertThat(activity.viewBinding.bottomSheet.layoutParams.height)
                 .isEqualTo(WRAP_CONTENT)
 
-            viewModel.transitionTo(PaymentSheetViewModel.TransitionTarget.AddPaymentMethodFull)
+            viewModel.transitionTo(
+                PaymentSheetViewModel.TransitionTarget.AddPaymentMethodFull(
+                    FragmentConfigFixtures.DEFAULT
+                )
+            )
             idleLooper()
             assertThat(currentFragment(activity))
                 .isInstanceOf(PaymentSheetAddCardFragment::class.java)
@@ -185,16 +184,19 @@ internal class PaymentSheetActivityTest {
             // animating out
             assertThat(activity.bottomSheetBehavior.state)
                 .isEqualTo(BottomSheetBehavior.STATE_HIDDEN)
-
-            assertThat(
-                contract.parseResult(0, shadowOf(activity).resultIntent)
-            ).isEqualTo(
-                PaymentResult.Cancelled(
-                    null,
-                    PAYMENT_INTENT
-                )
-            )
         }
+
+        assertThat(
+            contract.parseResult(
+                scenario.getResult().resultCode,
+                scenario.getResult().resultData
+            )
+        ).isEqualTo(
+            PaymentResult.Canceled(
+                null,
+                PAYMENT_INTENT
+            )
+        )
     }
 
     @Test
@@ -217,40 +219,39 @@ internal class PaymentSheetActivityTest {
             assertThat(activity.viewBinding.buyButton.isEnabled)
                 .isFalse()
 
-            // payment intent was confirmed and result will be communicated through PaymentRelayActivity
-            val nextActivity = shadowOf(activity).peekNextStartedActivity()
-            assertThat(nextActivity.component?.className)
-                .isEqualTo(PaymentRelayActivity::class.java.name)
+            assertThat(viewModel.startConfirm.value)
+                .isEqualTo(
+                    ConfirmPaymentIntentParams(
+                        clientSecret = "client_secret",
+                        paymentMethodId = "pm_123456789"
+                    )
+                )
         }
     }
 
     @Test
-    fun `reports successful payment intent result`() {
+    fun `successful payment should dismiss bottom sheet`() {
+        paymentFlowResultProcessor.paymentIntentResult = PaymentIntentResult(
+            intent = PAYMENT_INTENT.copy(status = StripeIntent.Status.Succeeded),
+            outcomeFromFlow = StripeIntentResult.Outcome.SUCCEEDED
+        )
+
         val scenario = activityScenario()
         scenario.launch(intent).onActivity { activity ->
             // wait for bottom sheet to animate in
             testDispatcher.advanceTimeBy(500)
             idleLooper()
 
-            viewModel.onActivityResult(
-                StripePaymentController.PAYMENT_REQUEST_CODE,
-                Intent().apply {
-                    putExtras(
-                        PaymentController.Result(
-                            "client_secret",
-                            StripeIntentResult.Outcome.SUCCEEDED
-                        ).toBundle()
-                    )
-                }
+            viewModel.onPaymentFlowResult(
+                PaymentFlowResult.Unvalidated(
+                    "client_secret",
+                    StripeIntentResult.Outcome.SUCCEEDED
+                )
             )
             idleLooper()
 
             assertThat(activity.bottomSheetBehavior.state)
                 .isEqualTo(BottomSheetBehavior.STATE_HIDDEN)
-            assertThat(contract.parseResult(0, shadowOf(activity).resultIntent))
-                .isEqualTo(
-                    PaymentResult.Succeeded(PAYMENT_INTENT)
-                )
         }
     }
 
@@ -259,17 +260,14 @@ internal class PaymentSheetActivityTest {
         val viewModel = PaymentSheetViewModel(
             publishableKey = ApiKeyFixtures.FAKE_PUBLISHABLE_KEY,
             stripeAccountId = null,
-            stripeRepository = FakeStripeRepository(PAYMENT_INTENT, listOf()),
-            paymentController = StripePaymentController(
-                context,
-                ApiKeyFixtures.FAKE_PUBLISHABLE_KEY,
-                stripeRepository,
-                workContext = testDispatcher
-            ),
+            paymentIntentRepository = PaymentIntentRepository.Static(PAYMENT_INTENT),
+            paymentMethodsRepository = PaymentMethodsRepository.Static(emptyList()),
+            paymentFlowResultProcessor = paymentFlowResultProcessor,
             googlePayRepository = googlePayRepository,
-            prefsRepository = mock(),
+            prefsRepository = FakePrefsRepository(),
             eventReporter = eventReporter,
             args = PaymentSheetFixtures.ARGS_CUSTOMER_WITH_GOOGLEPAY,
+            animateOutMillis = 0,
             workContext = testDispatcher
         )
 
@@ -292,15 +290,19 @@ internal class PaymentSheetActivityTest {
 
             assertThat(activity.bottomSheetBehavior.state)
                 .isEqualTo(BottomSheetBehavior.STATE_HIDDEN)
-            assertThat(
-                contract.parseResult(0, shadowOf(activity).resultIntent)
-            ).isEqualTo(
-                PaymentResult.Cancelled(
-                    null,
-                    PAYMENT_INTENT
-                )
-            )
         }
+
+        assertThat(
+            contract.parseResult(
+                scenario.getResult().resultCode,
+                scenario.getResult().resultData
+            )
+        ).isEqualTo(
+            PaymentResult.Canceled(
+                null,
+                PAYMENT_INTENT
+            )
+        )
     }
 
     @Test
@@ -308,13 +310,13 @@ internal class PaymentSheetActivityTest {
         val scenario = activityScenario(viewModel)
         scenario.launch(intent).onActivity { activity ->
             assertThat(activity.viewBinding.buyButton.isEnabled)
-                .isFalse()
+                .isTrue()
             // wait for bottom sheet to animate in
             testDispatcher.advanceTimeBy(BottomSheetController.ANIMATE_IN_DELAY)
             idleLooper()
 
             assertThat(activity.viewBinding.buyButton.isEnabled)
-                .isFalse()
+                .isTrue()
 
             viewModel.updateSelection(PaymentSelection.GooglePay)
             idleLooper()
@@ -337,33 +339,8 @@ internal class PaymentSheetActivityTest {
         }
     }
 
-    private class FakeStripeRepository(
-        val paymentIntent: PaymentIntent,
-        val paymentMethods: List<PaymentMethod>
-    ) : AbsFakeStripeRepository() {
-        override suspend fun getPaymentMethods(
-            listPaymentMethodsParams: ListPaymentMethodsParams,
-            publishableKey: String,
-            productUsageTokens: Set<String>,
-            requestOptions: ApiRequest.Options
-        ): List<PaymentMethod> {
-            return paymentMethods
-        }
-
-        override suspend fun confirmPaymentIntent(
-            confirmPaymentIntentParams: ConfirmPaymentIntentParams,
-            options: ApiRequest.Options,
-            expandFields: List<String>
-        ): PaymentIntent = paymentIntent
-
-        override suspend fun retrievePaymentIntent(
-            clientSecret: String,
-            options: ApiRequest.Options,
-            expandFields: List<String>
-        ): PaymentIntent = paymentIntent
-    }
-
     private companion object {
         private val PAYMENT_INTENT = PaymentIntentFixtures.PI_REQUIRES_PAYMENT_METHOD
+        private val PAYMENT_METHODS = listOf(PaymentMethodFixtures.CARD_PAYMENT_METHOD)
     }
 }

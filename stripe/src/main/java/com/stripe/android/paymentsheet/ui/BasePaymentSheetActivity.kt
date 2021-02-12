@@ -18,7 +18,7 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 
 internal abstract class BasePaymentSheetActivity<ResultType> : AppCompatActivity() {
-    abstract val viewModel: SheetViewModel<*, *>
+    abstract val viewModel: SheetViewModel<*>
     abstract val bottomSheetController: BottomSheetController
     abstract val eventReporter: EventReporter
 
@@ -47,7 +47,6 @@ internal abstract class BasePaymentSheetActivity<ResultType> : AppCompatActivity
         }
 
         viewModel.processing.observe(this) { isProcessing ->
-            bottomSheetController.setDraggable(!isProcessing)
             updateRootViewClickHandling(isProcessing)
         }
 
@@ -67,6 +66,10 @@ internal abstract class BasePaymentSheetActivity<ResultType> : AppCompatActivity
             bottomSheet.updateLayoutParams { height = mode.height }
             bottomSheetController.updateState(mode)
         }
+
+        // Make `bottomSheet` clickable to prevent clicks on the bottom sheet from triggering
+        // `rootView`'s click listener
+        bottomSheet.isClickable = true
     }
 
     override fun finish() {
@@ -114,7 +117,8 @@ internal abstract class BasePaymentSheetActivity<ResultType> : AppCompatActivity
         }
     }
 
-    protected companion object {
+    internal companion object {
+        const val EXTRA_FRAGMENT_CONFIG = "com.stripe.android.paymentsheet.extra_fragment_config"
         const val EXTRA_STARTER_ARGS = "com.stripe.android.paymentsheet.extra_starter_args"
     }
 }
